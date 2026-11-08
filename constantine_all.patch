@@ -1,0 +1,963 @@
+diff --git a/src/constantine.py b/src/constantine.py
+index 39380f4..b5ed152 100755
+--- a/src/constantine.py
++++ b/src/constantine.py
+@@ -34,6 +34,11 @@ SAFE_OPTS='-tti -tbaa -scoped-noalias -assumption-cache-tracker -targetlibinfo -
+ 
+ script_dir = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+ 
++# source_files = '/constantine/src/toy/utils.c /constantine/src/toy/fft.c /constantine/src/toy/complex.c /constantine/src/toy/keygen.c /constantine/src/toy/ntt.c'
++# source_files_o = '/constantine/src/toy/utils.o /constantine/src/toy/fft.o /constantine/src/toy/complex.o /constantine/src/toy/keygen.o /constantine/src/toy/ntt.o'
++# source_files_o = '/constantine/src/toy/utils_nosan.o /constantine/src/toy/fft_nosan.o /constantine/src/toy/complex_nosan.o /constantine/src/toy/keygen_nosan.o /constantine/src/toy/ntt_nosan.o'
++source_files_o =''
++
+ is_cxx = "++" in sys.argv[0]
+ if is_cxx:
+     cc = 'clang++'
+@@ -205,7 +210,7 @@ def fix_linker_groups(args):
+             return
+ 
+ # build the dft-sanitized program to trace taint value
+-def build_dft(input, optimization_level):
++def build_dft(input, optimization_level, N):
+     name = input[: input.rfind('.')]
+ 
+     if is_cxx:
+@@ -215,7 +220,7 @@ def build_dft(input, optimization_level):
+         cflags = os.environ.get('CFLAGS', '')
+         ldflags = os.environ.get('LDFLAGS', '')
+ 
+-    CFLAGS  = f"-O{optimization_level} -fno-unroll-loops -mllvm -x86-cmov-converter=0 -g"
++    CFLAGS  = f"-O{optimization_level} -DN={N} -fno-unroll-loops -mllvm -x86-cmov-converter=0 -g" #cmov로 바꾸지 말 것 = 0, 바꿔라 = 1
+     OFLAGS  = f"-O{optimization_level}"
+     LDFLAGS = f"-O{optimization_level} " + ldflags
+ 
+@@ -224,9 +229,10 @@ def build_dft(input, optimization_level):
+     dir_path = os.path.dirname(os.path.realpath(__file__))
+     with open('dfsan_abilist.txt', 'wb') as f:
+         check_call(f'cat {DFSAN_ABILIST} {dir_path}/lib/dft/dfsan.abilist', shell=True, stdout=f)
+-
++        
+     # obtain the bitcode from the input
+-    cc_exec(f'-Xclang -disable-O0-optnone -g {cflags} -flto -c -o {name}.base.bc {input} -fno-exceptions')
++    # cc_exec(f'-fPIE -Xclang -I/cipherfix/mbedtls/include -disable-O0-optnone -g {cflags} -DN={N} -flto -c -o {name}.base.bc {input} -fno-exceptions')
++    cc_exec(f'-fPIE -Xclang -disable-O0-optnone -g {cflags} -DN={N} -flto -c -o {name}.base.bc {input} -fno-exceptions')
+     link_exec(f'-o {name}.linked.bc {name}.base.bc')
+ 
+     # SSA form and remove unnneeded functions
+@@ -255,9 +261,10 @@ def build_dft(input, optimization_level):
+     opt_exec(f'-dfsan -dfsan-abilist=dfsan_abilist.txt -fix-callsite-attrs {OFLAGS} -check-undefined -o {name}.final.bc {name}.hook.bc')
+ 
+     # produce output
+-    cc_exec(f'{CFLAGS} -fPIC -DPIC -o {name}.final.o -c {name}.final.bc')
+-    cc_exec(f'{LDFLAGS} -fno-exceptions -fsanitize=dataflow -o {name}.dft.out -ldl {name}.final.o {dir_path}/lib/dft/dft.o')
+-
++    cc_exec(f'{CFLAGS} -fno-optimize-sibling-calls -fPIC -fPIE -DPIC -o {name}.final.o  -c {name}.final.bc')
++    cc_exec(f'{LDFLAGS}  -fno-exceptions -pie -fPIE -fsanitize=dataflow -o {name}.dft.out -ldl {name}.final.o {dir_path}/lib/dft/dft.o /constantine/src/cipherfix_interface_san.o /constantine/src/cipherfix_interface_nosan.o '+ source_files_o +' -lm')
++    # cc_exec(f'{CFLAGS} -fno-optimize-sibling-calls -fPIC -fPIE -DPIC -I/cipherfix/mbedtls/include -o {name}.final.o  -c {name}.final.bc')
++    # cc_exec(f'{LDFLAGS}  -fno-exceptions -pie -fPIE -fsanitize=dataflow -o {name}.dft.out -ldl {name}.final.o {dir_path}/lib/dft/dft.o /constantine/src/cipherfix_interface_san.o '+ source_files_o +'-L/cipherfix/mbedtls/library /cipherfix/mbedtls/build_dfsan/library/libmbedtls.a /cipherfix/mbedtls/build_dfsan/library/libmbedx509.a /cipherfix/mbedtls/build_dfsan/library/libmbedcrypto.a -lm')
+ # simple implementation where we do random testing, as it is enough for crypto algorithms
+ def get_next_input():
+     return bytearray(random.getrandbits(8) for _ in range(128))
+@@ -265,24 +272,99 @@ def get_test_suite_size():
+     return 256
+ 
+ # run the test suite on the DFT program to gather taint information on the visited paths
+-def run_test_suite_dft(input, dft_log):
+-    dft_tmp = 'dft.raw'
++# def run_test_suite_dft(input, dft_log, N):
++#     if N is not None and os.path.exists('dft.log'):
++#         new_name = f'dft_N{N}.log'
++#         shutil.move('dft.log', new_name)
++#         print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] Renamed dft.log → {new_name}')
++#     dft_tmp = 'dft.raw'
++#     name = input[: input.rfind('.')]
++#     if os.path.exists(dft_tmp):
++#         os.remove(dft_tmp)
++
++#     # run the profiler for each input in the test suite
++#     for _ in range(get_test_suite_size()):
++#         input_bytes = get_next_input()
++#         check_output(f'{name}.dft.out', shell=True, input=input_bytes)
++#         # the binary will dump a dft.log file, save it
++#         with open(dft_log,  'rb') as r:
++#             with open(dft_tmp, 'ab') as w:
++#                 w.write(r.read())
++    
++#     with open(dft_log, 'wb') as f:
++#         check_call(f'cat {dft_tmp} | sort | uniq', shell=True, stdout=f)
++#     os.remove(dft_tmp)
++
++
++def run_test_suite_dft(input, dft_log, N):
++    if os.path.exists(dft_log):
++        os.remove(dft_log)
++        print(f'[{bcolors.WARNING}-{bcolors.ENDC}] Removed existing output file: {dft_log}')
++    
++    # libdft가 고정적으로 뱉어내는 파일명
++    hardcoded_log = 'dft.log' 
++    # 중간 데이터를 모을 임시 파일
++    raw_tmp = 'dft.raw'
++
++    if os.path.exists(raw_tmp):
++        os.remove(raw_tmp)
++    if os.path.exists(hardcoded_log):
++        os.remove(hardcoded_log)
++
++    print(f'[{bcolors.OKBLUE}*{bcolors.ENDC}] Running test suite ({get_test_suite_size()} iterations)...')
+     name = input[: input.rfind('.')]
+-    if os.path.exists(dft_tmp):
+-        os.remove(dft_tmp)
+ 
+-    # run the profiler for each input in the test suite
+     for _ in range(get_test_suite_size()):
+         input_bytes = get_next_input()
++        
++        # 바이너리 실행 -> 결과로 'dft.log'가 생성됨
+         check_output(f'{name}.dft.out', shell=True, input=input_bytes)
+-        # the binary will dump a dft.log file, save it
+-        with open(dft_log,  'rb') as r:
+-            with open(dft_tmp, 'ab') as w:
+-                w.write(r.read())
++        
++        # 생성된 dft.log를 읽어서 raw 파일에 이어붙이기
++        if os.path.exists(hardcoded_log):
++            with open(hardcoded_log, 'rb') as r:
++                with open(raw_tmp, 'ab') as w:
++                    w.write(r.read())
++            # 다음 루프를 위해 dft.log 삭제
++            os.remove(hardcoded_log)
++
++    if os.path.exists(raw_tmp):
++        print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] Finalizing log to: {dft_log}')
++        with open(dft_log, 'wb') as f:
++            # dft.raw -> sort | uniq -> dft_log (최종 파일 생성)
++            check_call(f'cat {raw_tmp} | sort | uniq', shell=True, stdout=f)
++        os.remove(raw_tmp) # 임시 파일 정리
++    else:
++        # 로그가 하나도 안 쌓였을 경우 빈 파일이라도 생성 (에러 방지)
++        print(f'[{bcolors.WARNING}!{bcolors.ENDC}] No taint logs collected.')
++        check_call(f'touch {dft_log}', shell=True)
+     
+-    with open(dft_log, 'wb') as f:
+-        check_call(f'cat {dft_tmp} | sort | uniq', shell=True, stdout=f)
+-    os.remove(dft_tmp)
++    # default_dft_out = dft_log
++    # if os.path.exists(default_dft_out):
++    #     os.remove(default_dft_out)
++
++    # dft_tmp = 'dft.raw'
++    # name = input[: input.rfind('.')]
++    
++    # # 임시 파일 초기화
++    # if os.path.exists(dft_tmp):
++    #     os.remove(dft_tmp)
++
++    # # run the profiler for each input in the test suite
++    # for _ in range(get_test_suite_size()):
++    #     input_bytes = get_next_input()
++    #     check_output(f'{name}.dft.out', shell=True, input=input_bytes)
++    #     # the binary will dump a dft.log file, save it
++    #     with open(dft_log,  'rb') as r:
++    #         with open(dft_tmp, 'ab') as w:
++    #             w.write(r.read())
++        
++    
++    # with open(dft_log, 'wb') as f:
++    #     check_call(f'cat {dft_tmp} | sort | uniq', shell=True, stdout=f)
++    # os.remove(dft_tmp)
++
++       
+ 
+ def process_taint_info(input, taint_file, taint_log, dft_log_file):
+     name = input[: input.rfind('.')]
+@@ -297,12 +379,13 @@ def process_taint_info(input, taint_file, taint_log, dft_log_file):
+     # process taints
+     check_call(f'cut -f2,3,4 -d":" --output-delimiter=" " -s {dft_log_file} > {taint_log}', shell=True)
+ 
+-def build_loop_trace(input, taint_log, optimization_level):
++def build_loop_trace(input, taint_log, optimization_level, N):
+     name = input[: input.rfind('.')]
+     dir_path = os.path.dirname(os.path.realpath(__file__))
+     
+-    CFLAGS  = f"-O{optimization_level} -fno-unroll-loops -mllvm -x86-cmov-converter=0 -g"
++    CFLAGS  = f"-O{optimization_level} -DN={N} -fno-unroll-loops -mllvm -x86-cmov-converter=0 -g"
+     OFLAGS  = f"-O{optimization_level}"
++    # LDFLAGS = f"-O{optimization_level} -Wl,-T,/cipherfix/toy/instr-fast-aesrng/default.lds -Wl,-z,separate-code -Wl,-z,relro -Wl,-z,now -Wl,--export-dynamic "
+     LDFLAGS = f"-O{optimization_level} "
+ 
+     # load metadata on tainted instructions
+@@ -322,8 +405,10 @@ def build_loop_trace(input, taint_log, optimization_level):
+     opt_exec(f'-internalize -internalize-public-api-list=main -fix-callsite-attrs {OFLAGS} -check-undefined -o {name}.final.bc {name}.loops-cfl.bc')
+ 
+     # produce output
+-    cc_exec(f'{CFLAGS} -fPIC -DPIC -o {name}.final.o -c {name}.final.bc')
+-    cc_exec(f'{LDFLAGS} -fno-exceptions -o {name}.dumper.out {name}.final.o')
++    cc_exec(f'{CFLAGS} -fno-optimize-sibling-calls -fPIC -fPIE -DPIC -o {name}.final.o -c {name}.final.bc -lm')
++    cc_exec(f'{LDFLAGS} -fno-exceptions -pie -fPIE -DN={N} -o {name}.dumper.out {name}.final.o /constantine/src/cipherfix_interface_san.o /constantine/src/cipherfix_interface_nosan.o '+ source_files_o +'-lm')
++    # cc_exec(f'{CFLAGS} -I/cipherfix/mbedtls/include -fno-optimize-sibling-calls -fPIC -fPIE -DPIC -o {name}.final.o  -c {name}.final.bc')
++    # cc_exec(f'{LDFLAGS} -fno-exceptions -pie -fPIE -DN={N} -o {name}.dumper.out {name}.final.o /constantine/src/cipherfix_interface_san.o '+ source_files_o +'-L/cipherfix/mbedtls/library /cipherfix/mbedtls/build_dfsan/library/libmbedtls.a /cipherfix/mbedtls/build_dfsan/library/libmbedx509.a /cipherfix/mbedtls/build_dfsan/library/libmbedcrypto.a -lm')
+ 
+ # run the test suite on the loop instrumented program to gather taint information on the visited paths
+ def run_test_suite_loop(input, loop_log):
+@@ -345,12 +430,13 @@ def run_test_suite_loop(input, loop_log):
+         check_call(f'cat {log_tmp} | sort | uniq', shell=True, stdout=f)
+     os.remove(log_tmp)
+ 
+-def build_constant_time(input, output, taint_log, loop_log, optimization_level):
++def build_constant_time(input, output, taint_log, loop_log, optimization_level, N):
+     name = input[: input.rfind('.')]
+     dir_path = os.path.dirname(os.path.realpath(__file__))
+     
+-    CFLAGS  = f"-O{optimization_level} -fno-unroll-loops -mllvm -x86-cmov-converter=0 -g -fno-delete-null-pointer-checks "
++    CFLAGS  = f"-O{optimization_level} -DN={N} -fno-unroll-loops -mllvm -x86-cmov-converter=0 -g -fno-delete-null-pointer-checks "
+     OFLAGS  = f"-O{optimization_level}"
++    # LDFLAGS = f"-O{optimization_level} -Wl,-T,/cipherfix/toy/instr-fast-aesrng/default.lds -Wl,-z,separate-code -Wl,-z,relro -Wl,-z,now -Wl,--export-dynamic "
+     LDFLAGS = f"-O{optimization_level} "
+ 
+     # load metadata on tainted instructions
+@@ -382,8 +468,12 @@ def build_constant_time(input, output, taint_log, loop_log, optimization_level):
+     opt_exec(f'-internalize -internalize-public-api-list=main -fix-callsite-attrs {OFLAGS} -o {name}.final.bc {name}.div.bc')
+ 
+     # produce output
+-    cc_exec(f'{CFLAGS} -fPIC -DPIC -o {name}.final.o -c {name}.final.bc')
+-    cc_exec(f'{LDFLAGS} -fno-exceptions -o {output} {name}.final.o')
++    cc_exec(f'{CFLAGS} -fno-optimize-sibling-calls -fPIC -fPIE -DPIC -o {name}.final.o -c {name}.final.bc')
++    cc_exec(f'{LDFLAGS} -fno-exceptions -pie -fPIE -DN={N} -o {output} {name}.final.o /constantine/src/cipherfix_interface_san.o /constantine/src/cipherfix_interface_nosan.o '+ source_files_o +' -lm')
++
++    # cc_exec(f'{CFLAGS} -fno-optimize-sibling-calls -fPIC -fPIE -DPIC -I/cipherfix/mbedtls/include -o {name}.final.o -c {name}.final.bc')
++    # cc_exec(f'{LDFLAGS} -fno-exceptions -pie -fPIE -DN={N} -o {output} {name}.final.o /constantine/src/cipherfix_interface_san.o '+ source_files_o +'-L/cipherfix/mbedtls/library /cipherfix/mbedtls/build_dfsan/library/libmbedtls.a /cipherfix/mbedtls/build_dfsan/library/libmbedx509.a /cipherfix/mbedtls/build_dfsan/library/libmbedcrypto.a -lm')
++    # cc_exec(f'{LDFLAGS} -fno-exceptions -pie -o {output} {name}.final.o -lm')
+ 
+ 
+ 
+@@ -391,39 +481,64 @@ def build_constant_time(input, output, taint_log, loop_log, optimization_level):
+ @click.argument('input', type=click.Path(exists=True))
+ @click.option('-o', '--output', type=str, default='')
+ @click.option('-O', '--optimization_level', type=int, default=3)
+-def constantine_compile(input:str, output, optimization_level:int):
++@click.option('-N', '--param_N', 'param_N', type=int, default=128, help='Polynomial modulus degree (N)')
++
++def constantine_compile(input:str, output, optimization_level:int, param_N: int):
+ 
+     name = input[: input.rfind('.')]
+-    taint_file = f'{name}.taint'
+-    if output == '':
+-        output = f'{name}.out'
++    taint_file = f'{name}_N{param_N}.taint'
++    base = os.path.basename(name)
++    if "toy" in base:
++        output = f'toy_N{param_N}.out'
++    else:
++        output = f'{base}_N{param_N}.out'
++
++    # # build the dft version of the program to gather taint info
++    # print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] building taint profiler')
++    # build_dft(input, optimization_level)
++
++    # # run the test suite to gather taint info
++    # dft_log_file = 'dft.log'
++    # print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] running taint profiler')
++    # run_test_suite_dft(input, dft_log_file)
++
++    # # process the taint information and symbolize it
++    # taint_log = 'tainted.log'
++    # print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] processing taint information')
++    # process_taint_info(input, taint_file, taint_log, dft_log_file)
++
++    # # build the loop tracing version to gather info on loop execution
++    # print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] building loop profiler')
++    # build_loop_trace(input, taint_log, optimization_level)
++
++    # # run the test suite again to gather loop information
++    # loop_log_file = 'loops-cfl.conf'
++    # print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] running loop profiler')
++    # run_test_suite_loop(input, loop_log_file)
++
++    # # build the constant time version of the program
++    # print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] building constant time version')
++    # build_constant_time(input, output, taint_log, loop_log_file, optimization_level)
+ 
+-    # build the dft version of the program to gather taint info
+-    print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] building taint profiler')
+-    build_dft(input, optimization_level)
++    print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] building taint profiler (N={param_N})')
++    build_dft(input, optimization_level, param_N)
+ 
+-    # run the test suite to gather taint info
+-    dft_log_file = 'dft.log'
+     print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] running taint profiler')
+-    run_test_suite_dft(input, dft_log_file)
++    run_test_suite_dft(input, f'dft_N{param_N}.log', param_N)
+ 
+-    # process the taint information and symbolize it
+-    taint_log = 'tainted.log'
++    taint_log = f'tainted_N{param_N}.log'
+     print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] processing taint information')
+-    process_taint_info(input, taint_file, taint_log, dft_log_file)
++    process_taint_info(input, taint_file, taint_log, f'dft_N{param_N}.log')
+ 
+-    # build the loop tracing version to gather info on loop execution
+     print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] building loop profiler')
+-    build_loop_trace(input, taint_log, optimization_level)
++    build_loop_trace(input, taint_log, optimization_level, param_N)
+ 
+-    # run the test suite again to gather loop information
+-    loop_log_file = 'loops-cfl.conf'
++    loop_log_file = f'loops-cfl_N{param_N}.conf'
+     print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] running loop profiler')
+     run_test_suite_loop(input, loop_log_file)
+ 
+-    # build the constant time version of the program
+     print(f'[{bcolors.OKGREEN}+{bcolors.ENDC}] building constant time version')
+-    build_constant_time(input, output, taint_log, loop_log_file, optimization_level)
++    build_constant_time(input, output, taint_log, loop_log_file, optimization_level, param_N)
+ 
+ 
+ 
+diff --git a/src/lib/cfl/cfl.c b/src/lib/cfl/cfl.c
+index f8386b8..7879954 100644
+--- a/src/lib/cfl/cfl.c
++++ b/src/lib/cfl/cfl.c
+@@ -300,8 +300,14 @@ CFL_FUNC_INLINE signed long long cfl_sdiv(
+ 
+ CFL_FUNC_INLINE long double cfl_fdiv(
+     long double dividend, long double divisor, size_t size) {
+-    assert(0 && "Not implemented");
+-    return 0;
++
++    (void)size;
++
++    long double result = dividend / divisor;
++
++    DEBUG("CFL_FDIV: %Lg / %Lg = %Lg\n", dividend, divisor, result);
++    // assert(0 && "Not implemented");
++    return result;
+ }
+ 
+ #define CFL_SAFE_DIV(D) ((D)*taken+(1-taken))
+diff --git a/src/lib/dft/dfsan.abilist b/src/lib/dft/dfsan.abilist
+index 1116359..31220e9 100644
+--- a/src/lib/dft/dfsan.abilist
++++ b/src/lib/dft/dfsan.abilist
+@@ -1,3 +1,12 @@
+ fun:__dft_*=uninstrumented
+ fun:__dft_*=custom
+-
++fun:htons=uninstrumented
++fun:accept=uninstrumented
++fun:llround=functional
++fun:log=functional
++fun:cos=functional
++fun:sin=functional
++fun:srand=functional
++fun:rand=functional
++fun:clock=functional
++fun:fmodl=functional
+\ No newline at end of file
+diff --git a/src/lib/dft/hook.c b/src/lib/dft/hook.c
+index 6f357b9..2d3ad6f 100644
+--- a/src/lib/dft/hook.c
++++ b/src/lib/dft/hook.c
+@@ -1,8 +1,12 @@
+ #include <dft.h>
++#include "/cipherfix/cipherfix/examples/cipherfix_interface.h"
++
++static dfsan_label input_label;
+ 
+ /* Use this function to inject initialization steps */
+ void __attribute__((used)) __attribute__((noinline)) dft_pass_init(dfsan_label label) {
+     asm volatile ("");
++    input_label = label;
+     return;
+ }
+ 
+@@ -20,24 +24,38 @@ int __hook_wrap_call___main(DFT_ARG_PREFIX int argc, char** argv)
+ }
+ 
+ #ifdef DFT_WRAP_SOURCES
+-extern ssize_t __dft_read(void *buf, ssize_t size);
++// extern ssize_t __dft_read(void *buf, ssize_t size);
+ 
+-ssize_t __hook_wrap_call_read(DFT_ARG_PREFIX int fd, void *buf, size_t count)
+-{
+-	ssize_t size = read(fd, buf, count);
+-	return __dft_read(buf, size);
+-}
++// ssize_t __hook_wrap_call_read(DFT_ARG_PREFIX int fd, void *buf, size_t count)
++// {
++// 	ssize_t size = read(fd, buf, count);
++// 	return __dft_read(buf, size);
++// }
++
++// ssize_t __hook_wrap_call_pread(DFT_ARG_PREFIX int fd, void *buf, size_t count, off_t offset)
++// {
++// 	ssize_t size = pread(fd, buf, count, offset);
++// 	return __dft_read(buf, size);
++// }
++
++// size_t __hook_wrap_call_fread(DFT_ARG_PREFIX void *buf, size_t count, size_t n, FILE *stream)
++// {
++// 	ssize_t size = fread(buf, count, n, stream);
++// 	return (size_t) __dft_read(buf, size);
++// }
+ 
+-ssize_t __hook_wrap_call_pread(DFT_ARG_PREFIX int fd, void *buf, size_t count, off_t offset)
++// classify function implementation in 'cipherfix.h'
++//void __attribute__((noinline, optimize("O0"))) classify(void *ptr, int length) { asm (""); }
++void __hook_wrap_call_classify(DFT_ARG_PREFIX void *ptr, ssize_t length)
+ {
+-	ssize_t size = pread(fd, buf, count, offset);
+-	return __dft_read(buf, size);
++   classify(ptr, length);
++   dfsan_set_label(input_label, ptr, length);
+ }
+ 
+-size_t __hook_wrap_call_fread(DFT_ARG_PREFIX void *buf, size_t count, size_t n, FILE *stream)
++void __hook_wrap_call_declassify(DFT_ARG_PREFIX void *ptr, ssize_t length)
+ {
+-	ssize_t size = fread(buf, count, n, stream);
+-	return (size_t) __dft_read(buf, size);
++   declassify(ptr, length);
++   dfsan_set_label(0, ptr, length);
+ }
+ #endif
+ 
+diff --git a/src/passes/branch-enhance/branch-enhance.cpp b/src/passes/branch-enhance/branch-enhance.cpp
+index d6ffb48..18badec 100644
+--- a/src/passes/branch-enhance/branch-enhance.cpp
++++ b/src/passes/branch-enhance/branch-enhance.cpp
+@@ -136,6 +136,22 @@ namespace {
+         }
+     }
+ 
++    static bool isExitLikeBB(const llvm::BasicBlock *B) {
++  	const llvm::Instruction *T = B->getTerminator();
++
++  	if (llvm::isa<llvm::ReturnInst>(T) ||
++            llvm::isa<llvm::UnreachableInst>(T) ||
++            llvm::isa<llvm::ResumeInst>(T))
++            return true;
++
++  	if (const llvm::Instruction *Prev = T->getPrevNode())
++    		if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(Prev))
++      			if (CB->doesNotReturn())
++	        return true;
++
++  return false;
++}
++
+ 
+     void enhanceBranches(Function *F) {
+         DominatorTree *DT      = &getAnalysis<DominatorTreeWrapperPass>(*F).getDomTree();
+@@ -155,6 +171,11 @@ namespace {
+             BasicBlock* TrueBB = BI->getSuccessor(0);
+             BasicBlock* FalseBB = BI->getSuccessor(1);
+ 
++	    if (isExitLikeBB(TrueBB) || isExitLikeBB(FalseBB)) {
++   		 LLVM_DEBUG(llvm::dbgs()
++		   << "[branch-enhance] skip exit-like branch at " << BB.getName() << "\n");
++		 continue;
++	    }	
+ 
+             // structurize CFG should put the Flow block in the `false` side
+             // ensure that by checking that either the false side postdominates the true
+diff --git a/src/passes/branch-extract/branch-extract.cpp b/src/passes/branch-extract/branch-extract.cpp
+index 408c361..af01afe 100644
+--- a/src/passes/branch-extract/branch-extract.cpp
++++ b/src/passes/branch-extract/branch-extract.cpp
+@@ -510,17 +510,48 @@ namespace {
+                 else
+                     extracted = doExtract(F, IFC, *DT, *PDT, LI, ("branch_"+F.getName().str()).c_str());
+                 // Do one at a time, since we modify BBs in doExtract
+-                // qprint("extraction of ifc " << IFC.Branch->getParent()->getName().str() << (extracted? " success":" failed"));
++                // oprint("extraction of ifc " << IFC.Branch->getParent()->getName().str() << (extracted? " success":" failed"));
+                 if (extracted) {
+                     ++extractedBranches;
+                     ++extractedIFCs;
+                     if (needsCFL) {
++                        // oprint("[TAINTED] CFL!!! IFC Branch in Function '" << F.getName().str() << "' at BB '" << IFC.Branch->getParent()->getName() << "'");
++
++                        // // 소스 코드 위치 정보(파일, 줄 번호)를 가져와 출력합니다.
++                        // if (const DebugLoc &DL = IFC.Branch->getDebugLoc()) {
++                        // // MDNode*를 DIScope*로 안전하게 타입 변환(cast)합니다.
++                        //     if (DIScope *S = dyn_cast<DIScope>(DL.getScope())) {
++                        //         oprint("    -> Source : " << S->getFilename() << ":" << DL.getLine());
++                        //     }
++                        // } else {
++                        //     oprint("    -> Source : N/A (Compile with -g to enable debug info)");
++                        // }
++
++                        // // 어떤 LLVM 명령어인지 직접 출력합니다.
++                        // oprint("    -> Inst   : " << *IFC.Branch);
++
+                         ++taintedBranches;
+                         ++taintedIFCs;
+                         tainted_branches++;
+                     }
++                    else{
++                        // oprint("[TAINTED] IFC Branch in Function '" << F.getName().str() << "' at BB '" << IFC.Branch->getParent()->getName() << "'");
++
++                        // // 소스 코드 위치 정보(파일, 줄 번호)를 가져와 출력합니다.
++                        // if (const DebugLoc &DL = IFC.Branch->getDebugLoc()) {
++                        // // MDNode*를 DIScope*로 안전하게 타입 변환(cast)합니다.
++                        //     if (DIScope *S = dyn_cast<DIScope>(DL.getScope())) {
++                        //         oprint("    -> Source : " << S->getFilename() << ":" << DL.getLine());
++                        //     }
++                        // } else {
++                        //     oprint("    -> Source : N/A (Compile with -g to enable debug info)");
++                        // }
++
++                        // // 어떤 LLVM 명령어인지 직접 출력합니다.
++                        // oprint("    -> Inst   : " << *IFC.Branch);
++                    }
+                     count++;
+-                    dbgs() << "\r  extracting branches: " << count << "/" << tot_branches;
++                    // dbgs() << "\r  extracting branches: " << count << "/" << tot_branches;
+                     break;
+                 }
+             }
+diff --git a/src/passes/check-undefined/check-undefined.cpp b/src/passes/check-undefined/check-undefined.cpp
+index 456f3ad..5b5bf18 100644
+--- a/src/passes/check-undefined/check-undefined.cpp
++++ b/src/passes/check-undefined/check-undefined.cpp
+@@ -54,7 +54,7 @@ namespace {
+     void print_error(Instruction *I) {
+         BasicBlock *BB = I->getParent();
+         Function *F = BB->getParent();
+-        oprint("[WARNING] undef use: " << *I << " ( in " << F->getName().str() << ": " << BB->getName().str() << " )");
++        // oprint("[WARNING] undef use: " << *I << " ( in " << F->getName().str() << ": " << BB->getName().str() << " )");
+     }
+ 
+     void checkUndefined(Function *F) {
+diff --git a/src/passes/dfl/dfl.cpp b/src/passes/dfl/dfl.cpp
+index baaa05a..ec9f04e 100644
+--- a/src/passes/dfl/dfl.cpp
++++ b/src/passes/dfl/dfl.cpp
+@@ -207,7 +207,7 @@ namespace {
+                 CallSite CS(const_cast<Instruction*>(I));
+ 
+                 // accept malloc() or `_Znwm`=`operator new(unsigned long)`
+-                assert(CS.getCalledFunction()->getName().equals("malloc") || CS.getCalledFunction()->getName().equals("_Znwm"));
++                assert(CS.getCalledFunction()->getName().equals("malloc") || CS.getCalledFunction()->getName().equals("_Znwm")); // || CS.getCalledFunction()->getName().equals("calloc"));
+                 Value* allocSize = CS.getArgument(0);
+                 
+                 // ensure it is actually a constant size allocation
+@@ -251,6 +251,13 @@ namespace {
+             }
+         }
+ 
++        oprint("object: " << *obj << " obj_size: " << obj_size << "objT: " << *objT);
++
++        if (const Instruction* I = dyn_cast<Instruction>(obj)) {
++            const Function* F = I->getFunction();
++            oprint(" [in function: " << F->getName().str() << "]");
++        }          
++
+         assert(false && "No type guessed for the given object");
+         return nullptr;
+     }
+@@ -675,7 +682,6 @@ namespace {
+             noCastPtr = dyn_cast<CastInst>(ptr)->getOperand(0);
+         int BGID = getBGID(*memoryAccess);
+         int IBID = getIBID(*memoryAccess);
+-
+         dprint("-------------------------");
+         dprint("func: " << memoryAccess->getParent()->getParent()->getName().str());
+         dprint("access: " << *memoryAccess);
+@@ -842,6 +848,7 @@ namespace {
+             oprint(*memoryAccess);
+         }
+         assert(count > 0 || !getInstructionTaint(*memoryAccess));
++        
+         totObjAccesses += count;
+ 
+         // oprint("-> inserted " << count << " objects");
+@@ -1126,11 +1133,11 @@ namespace {
+             CFLedAccesses.erase(LI);
+         }
+ 
+-        // if (!singleAccess){
+-        //     oprint("-------------");
+-        //     oprint(*LI);
+-        //     oprint(*memoryPointer);
+-        // }
++        if (!singleAccess){
++            dprint("-------------");
++            dprint(*LI);
++            dprint(*memoryPointer);
++        }
+ 
+         // If the memory operation is marked as single access we have to retrieve
+         // the index where to perform such access, for all the possible objects
+@@ -1150,6 +1157,9 @@ namespace {
+             }
+         }
+ 
++        const Function* F = LI->getFunction();
++        dprint(" [in function: " << F->getName().str() << "]");
++
+ 
+         Value* loadResult = nullptr;
+         // Ensure there is at least another obj other than dummy
+@@ -1157,7 +1167,7 @@ namespace {
+         //     assert(ptrToObjs[memoryPointer].size());
+         // else
+         //     assert(ptrToObjs[memoryPointer].size() > 1);
+-
++        dprint("Wrapping load memory pointer : " << *memoryPointer << " with " << ptrToObjs[memoryPointer].size() << " objects");
+         // We are indexing ptrToObjs by pointers, so better check that the pointers
+         // still has not changed
+         assert(ptrToObjs.find(memoryPointer) != ptrToObjs.end());
+diff --git a/src/passes/hook/hook.cpp b/src/passes/hook/hook.cpp
+index 5c73c17..eb1799f 100644
+--- a/src/passes/hook/hook.cpp
++++ b/src/passes/hook/hook.cpp
+@@ -98,11 +98,40 @@ namespace {
+         }
+ 
+         static Value *cast_i64_i64_to_i128(Value *V, Instruction *InsertBefore) {
++
++            llvm::errs() << "\n[cast_i64_i64_to_i128] called!\n";
++
++            llvm::errs() << "  [V / CI value] : " << *V << "\n";
++            llvm::errs() << "  [V / CI type ] : ";
++            V->getType()->print(llvm::errs());
++            llvm::errs() << "\n";
++
++            if (InsertBefore) {
++                llvm::errs() << "  [InsertBefore / I inst] : " << *InsertBefore << "\n";
++                llvm::errs() << "  [InsertBefore / I type ] : ";
++                InsertBefore->getType()->print(llvm::errs());
++                llvm::errs() << "\n";
++            }
++
++            llvm::errs().flush();
+             LLVMContext& C = V->getContext();
+ 
+             Type* i128Ty = Type::getInt128Ty(C);
++
++            if (V->getType()->isIntegerTy(64)) {
++            llvm::errs() << "  [DEBUG] Handling direct i64 -> i128 extension\n";
++            return new ZExtInst(V, i128Ty, "", InsertBefore);
++            }
++
+             SmallVector<unsigned, 1> EVIndexes;
+ 
++            if (!is_i64_i64_type(V->getType())) {
++            llvm::errs() << "ERROR: Unexpected type in cast_i64_i64_to_i128: ";
++            V->getType()->print(llvm::errs());
++            llvm::errs() << "\n";
++            assert(false && "Type mismatch: Expected {i64, i64} or i64");
++            }
++
+             assert(is_i64_i64_type(V->getType()));
+ 
+             // Extract the elements from the {i64, i64} struct
+@@ -271,8 +300,8 @@ namespace {
+     void preHook(Instruction *I, Function *F) {
+         if (!F)
+             return;
+-        oprint("[+] preHook: " << F->getName().str());
+-        oprint("    on: " << *I);
++        //oprint("[+] preHook: " << F->getName().str());
++        //oprint("    on: " << *I);
+         std::vector<Value*> args;
+         unsigned offset = initHookBaseArgs(I, F, args);
+         initHookArgs(I, F, args, offset);
+@@ -285,15 +314,19 @@ namespace {
+             return;
+         LLVMContext& C = I->getContext();
+         Type* i128Ty = Type::getInt128Ty(C);
+-        oprint("[+] wrapHook: " << F->getName().str());
++	    oprint("[+] wrapHook: " << F->getName().str());
+         oprint("    on: " << *I);
+         std::vector<Value*> args;
+         unsigned offset = initHookBaseArgs(I, F, args);
+         initHookArgs(I, F, args, offset);
+         CallInst *CI = CallInst::Create(F, args, "", I);
+         if (I->getType() == i128Ty) {
+-            Value *CstI = Hooks::cast_i64_i64_to_i128(CI, I);
+-            I->replaceAllUsesWith(CstI);
++            // if(Hooks::is_i64_i64_type(((Value*)(CI))->getType())){
++                Value *CstI = Hooks::cast_i64_i64_to_i128(CI, I);
++                I->replaceAllUsesWith(CstI);
++            // }
++            // hookInlineAsNeeded(CI);
++            // return;
+         }
+         else if (!I->getType()->isVoidTy())
+             I->replaceAllUsesWith(createCast(CI, I->getType(), I));
+@@ -307,8 +340,8 @@ namespace {
+         Instruction *NextI = I->getNextNonDebugInstruction();
+         if (!NextI)
+             return;
+-        oprint("[+] postHook: " << F->getName().str());
+-        oprint("    on: " << *I);
++        //oprint("[+] postHook: " << F->getName().str());
++        //oprint("    on: " << *I);
+         std::vector<Value*> args;
+         unsigned i = initHookBaseArgs(I, F, args);
+         FunctionType *FT = F->getFunctionType();
+diff --git a/src/passes/icp/icp.cpp b/src/passes/icp/icp.cpp
+index 826bc84..c686b40 100644
+--- a/src/passes/icp/icp.cpp
++++ b/src/passes/icp/icp.cpp
+@@ -47,6 +47,12 @@ AliasSVFAnalysis("icp-alias",
+     cl::desc("Use slower alias-based points-to analysis."),
+     cl::init(false), cl::NotHidden);
+ 
++// NEW: force dropping EH by converting invokes to calls
++static cl::opt<bool>
++ForceInvokeToCall("icp-force-invoke-to-call",
++    cl::desc("Forcefully convert invoke to call and drop unwind edges before ICP"),
++    cl::init(true), cl::NotHidden);
++
+ namespace {
+ 
+   class ICPPass : public ModulePass {
+@@ -83,6 +89,10 @@ namespace {
+         if (FT == CT)
+             return true;
+ 
++	// Prvent replacing invoke into normal call
++        if (isa<InvokeInst>(CS.getInstruction()))
++            return false;
++
+         // Return types have to match, unless the callsite doesn't care.
+         if (!CT->getReturnType()->isVoidTy()
+             && !isCompatibleType(CT->getReturnType(), FT->getReturnType()))
+@@ -106,6 +116,53 @@ namespace {
+         return true;
+     }
+ 
++    Instruction* forceInvokeToCall(InvokeInst *II) {
++        // Convert an invoke to a normal call, drop the unwind edge, and branch to the normal dest.
++        BasicBlock *BB     = II->getParent();
++        BasicBlock *Normal = II->getNormalDest();
++        BasicBlock *Unwind = II->getUnwindDest();
++
++        // Collect call arguments (Invoke operands are Use*, so copy to Value* vector)
++        SmallVector<Value*, 8> Args;
++        Args.reserve(II->getNumArgOperands());
++        for (unsigned i = 0, e = II->getNumArgOperands(); i != e; ++i)
++            Args.push_back(II->getArgOperand(i));
++
++        // Preserve operand bundles (deopt, funclet, etc.)
++        SmallVector<OperandBundleDef, 2> Bundles;
++        II->getOperandBundlesAsDefs(Bundles);
++
++        // Build the call before the invoke
++        llvm::IRBuilder<> B(II);
++        CallInst *CI = B.CreateCall(II->getFunctionType(), II->getCalledValue(), Args, Bundles);
++        CI->setCallingConv(II->getCallingConv());
++        CI->setAttributes(II->getAttributes());
++        // NOTE: InvokeInst in LLVM 9 has no getTailCallKind(); do not copy it.
++        CI->setDebugLoc(II->getDebugLoc());
++
++        // Replace all uses of the invoke result if non-void
++        if (!II->getType()->isVoidTy())
++            II->replaceAllUsesWith(CI);
++
++        // Erase the invoke and terminate BB with a branch to the normal dest
++        II->eraseFromParent();
++        BranchInst::Create(Normal, BB);
++
++        // Remove incoming edge from BB in PHIs of the unwind dest (edge is gone now)
++        for (auto &I : *Unwind) {
++            if (auto *PN = dyn_cast<PHINode>(&I)) {
++                int idx = PN->getBasicBlockIndex(BB);
++                if (idx >= 0)
++                    PN->removeIncomingValue(idx, /*DeletePHIIfEmpty=*/false);
++            } else {
++                break; // PHIs are always first; done
++            }
++        }
++
++        // Unwind block will usually become unreachable and be cleaned up later.
++        return CI;
++    }
++
+     void getIndirectCallees(Module *M, CallSite &CS, std::vector<Function*> &callees, WPAPass *wpa) {
+         // Grab functions that may alias value at the callsite
+         Value *V = CS.getCalledValue()->stripPointerCasts();
+@@ -137,6 +194,13 @@ namespace {
+         Module* M = F->getParent();
+         LLVMContext& C = M->getContext();
+ 
++        if (ForceInvokeToCall) {
++            if (auto *II = dyn_cast<InvokeInst>(I)) {
++                Instruction *NewI = forceInvokeToCall(II);
++                I = NewI; // rebuild CallSite on the new CallInst
++            }
++        }
++
+         // retrieve the errx function
+         std::vector<Type *> args;
+         args.push_back(Type::getInt32Ty(C));
+@@ -147,7 +211,7 @@ namespace {
+         Function *ErrxF = dyn_cast<Function>(_errx.getCallee());
+         assert(ErrxF);
+ 
+-        oprint("Promoting indirect call: " << *I << " in " << F->getName().str());
++        // oprint("Promoting indirect call: " << *I << " in " << F->getName().str());
+         // Get indirect callees
+         CallSite CS(I);
+         std::vector<Function*> callees;
+@@ -192,7 +256,7 @@ namespace {
+             oprint("No callees available");
+             return;
+         }
+-        oprint(callees.size() << " callees possible");
++        // oprint(callees.size() << " callees possible");
+ 
+         // Check if we should only promote indirect calls to variadic functions.
+         if (VarArgOnly) {
+@@ -208,7 +272,7 @@ namespace {
+         // Promote with or without indirect call fallback.
+         Function *lastCallee = NULL;
+         for (auto Callee : callees) {
+-            oprint("possible callee: " << Callee->getName().str());
++            // oprint("possible callee: " << Callee->getName().str());
+             if (lastCallee)
+                 promoteCallWithIfThenElse(CS, lastCallee);
+             lastCallee = Callee;
+diff --git a/src/passes/loadtainted/loadtainted.cpp b/src/passes/loadtainted/loadtainted.cpp
+index ec2ba7d..59d05a5 100644
+--- a/src/passes/loadtainted/loadtainted.cpp
++++ b/src/passes/loadtainted/loadtainted.cpp
+@@ -304,6 +304,7 @@ namespace {
+                         // otherwise the branch may represent a special-case/error
+                         // contition that the user may not be interested in protecting
+                         if (BranchInst *BI = dyn_cast<BranchInst>(&I)) {
++                            // std::cout << "br inst " << b_gid << " " << i_bid << "," << taint->second << ","<< taint_value << std::endl;
+                             totalBranches++;
+                             if (IgnoreFixed && BI->isConditional() &&
+                                 branchesAndCmp.find(std::make_pair(b_gid, i_bid)) != branchesAndCmp.end()) {
+@@ -313,14 +314,21 @@ namespace {
+                                     nonTakenBranchesAndCmp.find(std::make_pair(b_gid, i_bid)) != nonTakenBranchesAndCmp.end()) {
+                                     varyingBranches++;
+                                 // otherwise the branch is not interesting
+-                                } else {
+-                                    taint_value = false;
+-                                    interesting = false;
+-                                    uninteresting_direction = (takenBranchesAndCmp.find(std::make_pair(b_gid, i_bid)) != takenBranchesAndCmp.end());
+-                                }
++                                } 
++                                // else {
++                                //     taint_value = false;
++                                //     interesting = false;
++                                //     uninteresting_direction = (takenBranchesAndCmp.find(std::make_pair(b_gid, i_bid)) != takenBranchesAndCmp.end());
++                                // }
++                            }
++
++                            if (taint_value) {
++                                taintedBranches++;
++                                // std::cout << "tainted br " << b_gid << " " << i_bid << "," << taint->second << ","<< taint_value << std::endl;
+                             }
+-                            if (taint_value) taintedBranches++;
+-                            else nonTaintedBranches++;
++                            else{
++                                nonTaintedBranches++;
++                            } 
+                         // Same for filtering taints on uninteresting cmp instructions
+                         } else if (CmpInst *CI = dyn_cast<CmpInst>(&I)) {
+                             if (IgnoreFixed && branchesAndCmp.find(std::make_pair(b_gid, i_bid)) != branchesAndCmp.end()) {
+@@ -379,12 +387,33 @@ namespace {
+             }
+         }
+ 
++        int count = 0;
++        int count_taint = 0;
++        for (auto &F : M.getFunctionList()) {
++            // if (F.isDeclaration())
++            //     continue;
++            for (llvm::BasicBlock &BB : F) {
++                for (auto &I : BB) {
++                    count++;
++                    if(getInstructionTaint(I)){
++			    count_taint++;
++			    oprint("Tainted Instruction : in F" << F.getName() << ", inst : " << I);
++		    }
++                }
++            }
++        }
++
++        
++
+         oprint("--------[ LOAD-TAINTED STATS ]--------");
+         oprint("[+] Seen Branches: " << totalBranches);
+         oprint("    [+] Varying:       " << varyingBranches);
+         oprint("    [+] Uninteresting: " << uninterestingBranches);
+         oprint("    [+] Tainted:       " << taintedBranches);
+         oprint("    [+] NonTainted:    " << nonTaintedBranches);
++
++        oprint("    [+] Total Count       " << count);
++        oprint("    [+] Total Tainted Count:    " << count_taint);
+         return false;
+     }
+ 
+diff --git a/src/passes/taint-stats/taint-stats.cpp b/src/passes/taint-stats/taint-stats.cpp
+index 866d7de..d615d63 100644
+--- a/src/passes/taint-stats/taint-stats.cpp
++++ b/src/passes/taint-stats/taint-stats.cpp
+@@ -22,7 +22,11 @@ namespace {
+     unsigned long totBranches = 0;
+     unsigned long totLoops = 0;
+     unsigned long totAccesses = 0;
+-    
++    unsigned long totReads = 0;
++    unsigned long totWrites = 0;
++    unsigned long count = 0;
++    unsigned long count_taint = 0;
++
+   public:
+     static char ID; // Pass identification, replacement for typeid
+     TaintStatsPass() : FunctionPass(ID) {
+@@ -35,10 +39,17 @@ namespace {
+         oprint("[+] Tot Branches:     " << totBranches);
+         oprint("[+] Tot Loops:        " << totLoops);
+         oprint("[+] Tot Accesses:     " << totAccesses);
++        oprint("[+] Sum:              " << totBranches + totLoops + totAccesses);
++        oprint("\n--------[ TAINT Instructions ]--------");
+         oprint("[+] Tainted Branches: " << taintedBranches);
+         oprint("[+] Tainted Loops:    " << taintedLoops);
+         oprint("[+] Tainted Reads:    " << taintedReads);
+         oprint("[+] Tainted Writes:   " << taintedWrites);
++
++        oprint("    [+] Total Reads:     " << totReads);
++        oprint("    [+] Total Writes:    " << totWrites);
++        oprint("    [+] Total Count:     " << count);
++        oprint("    [+] Total Tainted Count:     " << count_taint);
+     }
+ 
+     bool getInstructionTaint(Instruction &I) {
+@@ -56,6 +67,8 @@ namespace {
+         LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+         ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+ 
++        // oprint("\nTaint-stats.cpp : " << F.getName());
++
+         std::set<Instruction *> loopBranches;
+ 
+         for(Loop* L : LI.getLoopsInPreorder()) {
+@@ -73,14 +86,19 @@ namespace {
+         for (auto &BB : F)
+         for (auto &I : BB) {
+ 
++            count++;
++            if(getInstructionTaint(I)) count_taint++;
++
+             if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
+                 if (getInstructionTaint(I)) ++taintedReads;
+                 ++totAccesses;
++                ++totReads;
+                 continue;
+             }
+             if (StoreInst *SI = dyn_cast<StoreInst>(&I)) {
+                 if (getInstructionTaint(I)) ++taintedWrites;
+                 ++totAccesses;
++                ++totWrites;
+                 continue;
+             }
+ 
